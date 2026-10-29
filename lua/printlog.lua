@@ -12,7 +12,6 @@
 --   <leader>ld   delete all @print lines in the buffer (:PrintLogClean)
 --
 -- `path:line` works with `gF` (jump to file and line).
--- Function name comes from Treesitter. Haskell uses traceM (import Debug.Trace).
 
 local M = {}
 
