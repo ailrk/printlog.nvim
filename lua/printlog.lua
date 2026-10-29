@@ -11,7 +11,11 @@
 --   <leader>lO   insert log line above
 --   <leader>ld   delete all @print lines in the buffer (:PrintLogClean)
 --
+-- Tagged lines also show as warnings via vim.diagnostic (diagnostics = false
+-- to disable).
+--
 -- `path:line` works with `gF` (jump to file and line).
+-- Function name comes from Treesitter. Haskell uses traceM (import Debug.Trace).
 
 local M = {}
 
@@ -29,6 +33,10 @@ M.config = {
   keymap_clean = "<leader>ld",  -- delete all tagged lines in the current buffer
   -- marker appended as a trailing comment on every inserted line
   tag = "@print",
+  -- show a diagnostic on every tagged line (like an LSP warning)
+  diagnostics = true,
+  diagnostic_severity = "WARN",   -- ERROR | WARN | INFO | HINT
+  diagnostic_message = "debug print left in code (@print)",
   -- $P is replaced by the prefix; the cursor lands right after it
   templates = {
     c          = 'printf("$P");',
@@ -156,6 +164,35 @@ local function build_prefix(line_number, func)
   return out
 end
 
+local ns = vim.api.nvim_create_namespace("printlog")
+
+-- Mark every line containing the tag with a diagnostic.
+local function refresh_diagnostics(bufnr)
+  bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+  if not vim.api.nvim_buf_is_valid(bufnr) then return end
+  local cfg = M.config
+  if not cfg.diagnostics then
+    vim.diagnostic.reset(ns, bufnr)
+    return
+  end
+  local severity = vim.diagnostic.severity[cfg.diagnostic_severity] or vim.diagnostic.severity.WARN
+  local diags = {}
+  for i, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)) do
+    local col = line:find(cfg.tag, 1, true)
+    if col then
+      diags[#diags + 1] = {
+        lnum = i - 1,
+        col = col - 1,
+        end_col = col - 1 + #cfg.tag,
+        severity = severity,
+        source = "printlog",
+        message = cfg.diagnostic_message,
+      }
+    end
+  end
+  vim.diagnostic.set(ns, bufnr, diags)
+end
+
 -- Build the comment, e.g. "// @print", "-- @print", "# @print".
 local function tag_comment()
   local tag = M.config.tag
@@ -212,6 +249,7 @@ local function insert_log(above)
   -- Cursor: right after the prefix, still inside the string.
   local col = #indent + (marker - 1) + #prefix
   vim.api.nvim_win_set_cursor(0, { insert_at + 1, col })
+  refresh_diagnostics(bufnr)
   vim.cmd("startinsert")
 end
 
@@ -230,6 +268,7 @@ function M.clean()
       removed = removed + 1
     end
   end
+  refresh_diagnostics(bufnr)
   vim.notify(("printlog: removed %d line(s) tagged %s"):format(removed, tag))
 end
 
@@ -247,6 +286,14 @@ function M.setup(opts)
     vim.keymap.set("n", cfg.keymap_clean, M.clean, { desc = "Delete all tagged print logs in buffer" })
   end
   vim.api.nvim_create_user_command("PrintLogClean", M.clean, {})
+
+  -- Keep diagnostics up to date as buffers load and change.
+  local group = vim.api.nvim_create_augroup("printlog", { clear = true })
+  vim.api.nvim_create_autocmd(
+    { "BufEnter", "BufReadPost", "TextChanged", "InsertLeave", "BufWritePost" },
+    { group = group, callback = function(ev) refresh_diagnostics(ev.buf) end }
+  )
+  refresh_diagnostics(vim.api.nvim_get_current_buf())
 end
 
 return M
