@@ -8,8 +8,8 @@
 --
 -- KEYS
 --   <leader>lo   insert log line below
---   <leader>lO   insert log line above
---   <leader>ld   delete all @print lines in the buffer (:PrintLogClean)
+--   <leader>li   insert log snippet inline, at the cursor (great for Haskell trace)
+--   <leader>ld   delete all @print lines / inline snippets in the buffer (:PrintLogClean)
 --
 -- Tagged lines also show as warnings via vim.diagnostic (diagnostics = false
 -- to disable).
@@ -29,10 +29,12 @@ M.config = {
   format_no_func = "{path}:{line}: ",
   -- keymaps (set to false to disable)
   keymap_below = "<leader>lo",
-  keymap_above = "<leader>lO",
+  keymap_inline = "<leader>li",
   keymap_clean = "<leader>ld",  -- delete all tagged lines in the current buffer
   -- marker appended as a trailing comment on every inserted line
   tag = "@print",
+  -- marker for inline snippets; must start with `tag` so diagnostics still find it
+  tag_inline = "@print-inline",
   -- show a diagnostic on every tagged line (like an LSP warning)
   diagnostics = true,
   diagnostic_severity = "WARN",   -- ERROR | WARN | INFO | HINT
@@ -60,6 +62,20 @@ M.config = {
     haskell    = 'traceM "$P"',  -- needs: import Debug.Trace
   },
   default_template = 'print("$P")',
+  -- inline templates: inserted AT THE CURSOR, not on a new line.
+  -- Filetypes without an entry fall back to the statement template + " ".
+  inline_templates = {
+    haskell = 'trace "$P" $ ',   -- needs: import Debug.Trace
+  },
+  -- inline snippets need a block comment so the marker can sit mid-line
+  block_comments = {
+    haskell = "{- %s -}",
+    c = "/* %s */", cpp = "/* %s */", cs = "/* %s */", java = "/* %s */",
+    go = "/* %s */", rust = "/* %s */", php = "/* %s */",
+    javascript = "/* %s */", typescript = "/* %s */",
+    javascriptreact = "/* %s */", typescriptreact = "/* %s */",
+    lua = "--[[ %s ]]",
+  },
 }
 
 -- Neovim's TSNode has no child_by_field_name; :field(name) returns a list.
@@ -85,7 +101,6 @@ local FUNC_TYPES = {
   method = true,                -- ruby
   singleton_method = true,
   bind = true,                  -- haskell: `foo = ...` with no arguments
-  -- haskell's `function` node is already covered by ["function"] above
 }
 
 -- Dig the identifier out of a (possibly nested) C-style declarator.
@@ -253,23 +268,86 @@ local function insert_log(above)
   vim.cmd("startinsert")
 end
 
+-- Escape a string for use inside a Lua pattern.
+local function esc(s) return (s:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")) end
+
+-- Returns template and marker comment for the current filetype, or nil.
+local function inline_parts()
+  local cfg, ft = M.config, vim.bo.filetype
+  local bc = cfg.block_comments[ft]
+  if not bc then return nil end
+  local template = cfg.inline_templates[ft]
+      or ((cfg.templates[ft] or cfg.default_template) .. " ")
+  local comment = (bc:gsub("%%s", function() return cfg.tag_inline end))
+  return template, comment
+end
+
+-- Insert the snippet at the cursor, in place, without adding a new line.
+local function insert_inline()
+  local template, comment = inline_parts()
+  if not template then
+    vim.notify("printlog: no inline template/block comment for filetype '"
+      .. vim.bo.filetype .. "'", vim.log.levels.WARN)
+    return
+  end
+  local bufnr = vim.api.nvim_get_current_buf()
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0)) -- row 1-based, col 0-based
+
+  local func = find_function_name(bufnr, row - 1, col)
+  local prefix = build_prefix(row, func)
+
+  local marker = template:find("$P", 1, true)
+  local text = (template:gsub("%$P", function() return prefix end)) .. comment .. " "
+
+  vim.api.nvim_buf_set_text(bufnr, row - 1, col, row - 1, col, { text })
+  vim.api.nvim_win_set_cursor(0, { row, col + (marker - 1) + #prefix })
+  refresh_diagnostics(bufnr)
+  vim.cmd("startinsert")
+end
+
 function M.below() insert_log(false) end
 function M.above() insert_log(true) end
+function M.inline() insert_inline() end
 
--- Delete every line in the current buffer that contains the tag.
+-- Remove every tagged item in the current buffer:
+--   * full-line logs (tag)         -> the whole line is deleted
+--   * inline snippets (tag_inline) -> only the snippet is stripped, code stays
 function M.clean()
-  local tag = M.config.tag
+  local cfg = M.config
   local bufnr = vim.api.nvim_get_current_buf()
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  local removed = 0
+
+  -- Pattern matching an inline snippet (message text may have been edited).
+  local pat
+  local template, comment = inline_parts()
+  if template then
+    local before, after = template:match("^(.-)%$P(.*)$")
+    if before then pat = esc(before) .. ".-" .. esc(after .. comment .. " ") end
+  end
+
+  local removed, skipped = 0, 0
   for i = #lines, 1, -1 do
-    if lines[i]:find(tag, 1, true) then
+    local line = lines[i]
+    if line:find(cfg.tag_inline, 1, true) then
+      local new, n = line, 0
+      if pat then new, n = line:gsub(pat, "") end
+      if n > 0 then
+        vim.api.nvim_buf_set_lines(bufnr, i - 1, i, false, { new })
+        removed = removed + n
+      else
+        skipped = skipped + 1
+      end
+    elseif line:find(cfg.tag, 1, true) then
       vim.api.nvim_buf_set_lines(bufnr, i - 1, i, false, {})
       removed = removed + 1
     end
   end
   refresh_diagnostics(bufnr)
-  vim.notify(("printlog: removed %d line(s) tagged %s"):format(removed, tag))
+  local msg = ("printlog: removed %d tagged item(s)"):format(removed)
+  if skipped > 0 then
+    msg = msg .. (", skipped %d inline line(s) I couldn't match"):format(skipped)
+  end
+  vim.notify(msg)
 end
 
 function M.setup(opts)
@@ -279,8 +357,8 @@ function M.setup(opts)
   if cfg.keymap_below then
     vim.keymap.set("n", cfg.keymap_below, M.below, { desc = "Print log below (file:line func)" })
   end
-  if cfg.keymap_above then
-    vim.keymap.set("n", cfg.keymap_above, M.above, { desc = "Print log above (file:line func)" })
+  if cfg.keymap_inline then
+    vim.keymap.set("n", cfg.keymap_inline, M.inline, { desc = "Print log inline at cursor" })
   end
   if cfg.keymap_clean then
     vim.keymap.set("n", cfg.keymap_clean, M.clean, { desc = "Delete all tagged print logs in buffer" })
